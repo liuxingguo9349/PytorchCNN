@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+import torch.utils.data as Data
+import copy
+import sys
+import os
+import math
+import numpy as np
+from netCDF4 import Dataset
+
+from model import CNN,train_one_epoch,train_one_epoch_noupdate_lr,MyDataSet,create_lr_scheduler
+
+devices = 'cudanum'
+epochs = 300
+batch_size = 400
+learning_rate = 5e-3 #原cnn学习率
+num_conv = convfilter
+num_hidd = hiddfilter
+
+
+# lead_mon = 6
+# target_mon = 1
+
+#lmont = str(lead_mon)+'mon'+str(target_mon)
+
+tg_mn = int(target_mon - 1)
+ld_mn1 = int(23 - lead_mon + tg_mn)
+ld_mn2 = int(23 - lead_mon + tg_mn + 3)
+# Read Data (NetCDF4)
+inp1 = Dataset('/home/ln/input/CMIP5.input.36mon.1861_2001.nc','r')
+inp2 = Dataset('/home/ln/input/CMIP5.label.12mon.1863_2003.nc','r')
+
+inpv1 = np.zeros((2961,6,24,72),dtype=np.float32)
+inpv1[:,0:3,:,:] = inp1.variables['sst1'][0:2961,ld_mn1:ld_mn2,:,:]
+inpv1[:,3:6,:,:] = inp1.variables['t300'][0:2961,ld_mn1:ld_mn2,:,:]
+
+
+inpv2 = np.zeros((2961),dtype=np.float32)
+inpv2[:] = inp2.variables['pr'][0:2961,tg_mn,0,0]
+
+
+#测试集soda100
+soda = Dataset('/home/ln/input/SODA.input.36mon.1871_1970.nc','r')
+lablesoda = Dataset('/home/ln/input/SODA.label.12mon.1873_1972.nc','r')
+
+testsoda = np.zeros((100,6,24,72),dtype=np.float32)
+testsoda[:,0:3,:,:] = soda.variables['sst'][0:100,ld_mn1:ld_mn2,:,:]
+testsoda[:,3:6,:,:] = soda.variables['t300'][0:100,ld_mn1:ld_mn2,:,:]
+
+testlablesoda = np.zeros((100),dtype=np.float32)
+testlablesoda[:] = lablesoda.variables['pr'][0:100,tg_mn,0,0]
+
+
+def main():
+
+    device = torch.device(devices if torch.cuda.is_available() else "cpu")
+    print(f"using {device} device.")
+
+
+    #实例化数据集
+    train_dataset = MyDataSet(inpv1,inpv2)
+
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers多进程加载的进程数，0代表单进程
+    print('Using {} dataloader workers every process'.format(nw))
+   
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                               batch_size=batch_size,
+                                               shuffle=True,
+                                               pin_memory=False,
+                                               num_workers=nw,
+                                               )#collate_fn=train_dataset.collate_fn
+    #pin_memory=true可以更快的将tensor转到GPU，但占用的内存较多
+    #drop_last：告诉如何处理数据集长度除于batch_size余下的数据。默认为false，True就抛弃，false保留，剩多少用多少
+    #若不设置collate_fn参数则会使用默认处理函数 但必须保证传进来的数据都是tensor格式否则会报错
+    #可以试试不设置也就是默认collate_fn
+    """collate_fn可以在调用__getitem__函数后,将得到的batch_size个数据进行进一步的处理,
+    在迭代dataloader时,取出的数据批就是经过了collate_fn函数处理的数据。
+    换句话说,collate_fn的输入参数是__getitem__的返回值,dataloader的输出是collate_fn的返回值。"""
+    
+    model = CNN(num_conv=num_conv, num_hidd=num_hidd).to(device)
+
+    #alpha=0.9 衰减（平滑）系数，默认0.99，改为和tf一样0.9
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, alpha=0.9,eps=1e-10)
+    #optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
+
+    #学习率，根据训练次数调整
+    # lr_scheduler = create_lr_scheduler(optimizer, len(train_loader), epochs,
+    #                                    warmup=True, warmup_epochs=1)
+
+    many = epochs // 10
+    grad = np.zeros((many,6,24,72))
+    bestcor = -1
+    bestloss = float("inf")
+    cor = np.zeros((epochs))
+
+    #打印训练的参数和梯度情况
+    for name, param in model.named_parameters():
+        print(name,param.requires_grad)
+
+
+    for epoch in range(epochs):
+        print('grad shape:',grad.shape)
+        # train
+        """train_loss = train_one_epoch(model=model,
+                                    optimizer=optimizer,
+                                    data_loader=train_loader,
+                                    device=device,
+                                    epoch=epoch,
+                                    lr_scheduler=lr_scheduler)"""    
+
+        train_loss = train_one_epoch_noupdate_lr(model=model,
+                                    optimizer=optimizer,
+                                    data_loader=train_loader,
+                                    device=device,
+                                    epoch=epoch)
+
+        #预测
+        predict_dataset = torch.from_numpy(testsoda)
+
+        model.eval()#测试的时候加载模型之后要指定eval模式，迁移学习不用，还是modle.train（）
+
+        #with torch.no_grad():
+        #不需要保存梯度反向传播更新参数，可以减少显存使用，with torch.no_grad是不保存所有的梯度
+        #torch.squeeze维度压缩，不指定dim就删除所有大小为1的维
+        print('output shape:')
+        output = torch.squeeze(model(predict_dataset.to(device))).cpu()
+        result = output.detach().numpy()
+        print('result min and max:',result.min(),result.max())
+        print('mean:',result.mean())
+
+        obs = testlablesoda
+        
+        #result =result / np.std(result) #有时候会出现cor全为nan 的情况，可能是除0造成的
+        #obs = obs / np.std(obs)
+        thiscor = np.round(np.corrcoef(obs[:], result[:])[0, 1], 5)
+        cor[epoch] = thiscor
+        print('epoch,cor:',epoch,cor[epoch])
+        cor.astype('float32').tofile('/home/ln/document/lmont/cmip/chlist/ENnumber/lmontcmipcor.gdat')
+        
+        if not math.isnan(thiscor):
+            if thiscor >= bestcor:
+                torch.save(copy.deepcopy(model.state_dict()), '/home/ln/document/lmont/cmip/chlist/ENnumber/bestcmip_model.pth')#只保存权重,state_dict只是浅拷贝
+                #state_dict存的是个字典结构 key value对
+                bestcor = thiscor
+                print('best cor:',bestcor)
+            else:
+                print('this cor is not the best')
+                print('best cor is:',bestcor)
+        
+            torch.save(model.state_dict(), '/home/ln/document/lmont/cmip/chlist/ENnumber/last_model.pth')
+        else:
+            if train_loss < bestloss:
+
+                torch.save(copy.deepcopy(model.state_dict()), '/home/ln/document/lmont/cmip/chlist/ENnumber/bestcmip_model.pth')
+                bestloss = train_loss
+
+if __name__ == "__main__":
+    main()    
